@@ -3,7 +3,7 @@ NBA Player Data Fetcher and Supabase Uploader
 
 This script:
 1. Reads a list of player names from players.txt
-2. Fetches player IDs using the NBA API's search endpoint
+2. Fetches player IDs using the NBA API
 3. Retrieves detailed player data from various NBA API endpoints
 4. Stores the data in a structured Supabase database
 """
@@ -44,88 +44,171 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # NBA API configuration
+# Using the stats API directly
 NBA_API_BASE_URL = "https://stats.nba.com/stats"
+
+# Headers that mimic a browser
 NBA_API_HEADERS = {
-    'Accept': '*/*',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Connection': 'keep-alive',
     'Host': 'stats.nba.com',
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'x-nba-stats-origin': 'stats',
+    'x-nba-stats-token': 'true',
     'Origin': 'https://www.nba.com',
+    'Connection': 'keep-alive',
     'Referer': 'https://www.nba.com/',
-    'sec-ch-ua': '"Google Chrome";v="119", "Chromium";v="119", "Not?A_Brand";v="24"',
-    'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"Windows"',
+    'Pragma': 'no-cache',
+    'Cache-Control': 'no-cache',
     'Sec-Fetch-Dest': 'empty',
     'Sec-Fetch-Mode': 'cors',
-    'Sec-Fetch-Site': 'same-site',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+    'Sec-Fetch-Site': 'same-site'
 }
 
 # NBA API endpoints
-PLAYER_SEARCH_ENDPOINT = "/searchplayers"
 PLAYER_INFO_ENDPOINT = "/commonplayerinfo"
 PLAYER_STATS_ENDPOINT = "/playerdashboardbygeneralsplits"
 PLAYER_CAREER_ENDPOINT = "/playercareerstats"
 PLAYER_PROFILE_ENDPOINT = "/playerprofilev2"
 
+# For player search, use a more reliable endpoint
+PLAYER_ALL_ENDPOINT = "/commonallplayers"
+
 # Constants
-CURRENT_SEASON = "2024-25"  # Update as needed for the current season
+CURRENT_SEASON = "2024-25"  # Update for current season
 
 
 class NBADataFetcher:
     """Class to handle fetching data from the NBA API"""
 
-    def __init__(self, rate_limit_wait: float = 1.5):
+    def __init__(self, rate_limit_wait: float = 1.5, max_retries: int = 3):
         """
         Initialize the NBA data fetcher
 
         Args:
-            rate_limit_wait: Time to wait between API calls in seconds to avoid rate limiting
+            rate_limit_wait: Time to wait between API calls in seconds
+            max_retries: Maximum number of retry attempts for failed requests
         """
         self.rate_limit_wait = rate_limit_wait
+        self.max_retries = max_retries
+        self.all_players_cache = None  # Cache for all players
 
     def _make_api_request(self, endpoint: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
-        Make a request to the NBA API with rate limiting
+        Make a request to the NBA API with rate limiting and retries
 
         Args:
             endpoint: The API endpoint
             params: Query parameters for the request
 
         Returns:
-            The JSON response or None if the request failed
+            The JSON response or None if the request failed after retries
         """
         url = f"{NBA_API_BASE_URL}{endpoint}"
+        retries = 0
+        backoff = self.rate_limit_wait
 
-        # Always wait BEFORE making the request to ensure proper spacing between requests
-        # This is critical for the NBA API which has strict rate limiting
+        # Always wait BEFORE making the request
         time.sleep(self.rate_limit_wait)
         
-        try:
-            logger.debug(f"Making API request to {url} with params {params}")
-            response = requests.get(url, headers=NBA_API_HEADERS, params=params, timeout=15)
-            response.raise_for_status()
+        while retries <= self.max_retries:
+            try:
+                logger.debug(f"Making API request to {url} with params {params}")
+                response = requests.get(
+                    url, 
+                    headers=NBA_API_HEADERS, 
+                    params=params, 
+                    timeout=20,
+                    allow_redirects=False  # Prevent redirect loops
+                )
+                response.raise_for_status()
+                
+                # Check if we got a redirect
+                if response.status_code >= 300 and response.status_code < 400:
+                    logger.warning(f"Received redirect response ({response.status_code}). Adjusting approach.")
+                    retries += 1
+                    time.sleep(backoff)
+                    backoff *= 2  # Exponential backoff
+                    continue
+                
+                return response.json()
+                
+            except requests.exceptions.RequestException as e:
+                logger.error(f"API request error (attempt {retries+1}/{self.max_retries+1}): {e}")
+                retries += 1
+                
+                # If we're rate limited, wait longer
+                if hasattr(e, 'response') and e.response and e.response.status_code == 429:
+                    backoff = max(10, backoff * 2)  # At least 10 seconds, doubling each time
+                    logger.warning(f"Rate limited. Waiting {backoff} seconds before retrying...")
+                else:
+                    backoff *= 2  # Exponential backoff for other errors
+                
+                if retries <= self.max_retries:
+                    logger.info(f"Retrying in {backoff} seconds...")
+                    time.sleep(backoff)
+                else:
+                    logger.error(f"Failed after {self.max_retries+1} attempts.")
+                    return None
+    
+    def fetch_all_players(self, force_refresh: bool = False) -> Optional[List[Dict[str, Any]]]:
+        """
+        Fetch list of all NBA players
+        
+        Args:
+            force_refresh: Whether to force a refresh of the cached player list
             
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error making API request to {endpoint}: {e}")
-            # If we get a 429 (Too Many Requests), wait longer before retrying
-            if hasattr(e, 'response') and e.response and e.response.status_code == 429:
-                logger.warning("Rate limited. Waiting 10 seconds before retrying...")
-                time.sleep(10)
-                try:
-                    # Wait again before the retry
-                    time.sleep(self.rate_limit_wait)
-                    response = requests.get(url, headers=NBA_API_HEADERS, params=params, timeout=15)
-                    response.raise_for_status()
-                    return response.json()
-                except requests.exceptions.RequestException as retry_e:
-                    logger.error(f"Retry failed: {retry_e}")
+        Returns:
+            List of player dictionaries or None if the request failed
+        """
+        # Return cached results if available
+        if self.all_players_cache is not None and not force_refresh:
+            return self.all_players_cache
+            
+        logger.info("Fetching list of all NBA players...")
+        
+        # Using a more reliable endpoint
+        params = {
+            "LeagueID": "00",
+            "Season": CURRENT_SEASON,
+            "IsOnlyCurrentSeason": "1"
+        }
+        
+        response = self._make_api_request(PLAYER_ALL_ENDPOINT, params)
+        
+        if not response:
+            return None
+            
+        try:
+            result_sets = response.get("resultSets", [])
+            if not result_sets or not result_sets[0].get("rowSet"):
+                logger.warning("No players found in the response")
+                return None
+                
+            # Get column headers and row data
+            headers = result_sets[0]["headers"]
+            rows = result_sets[0]["rowSet"]
+            
+            # Create list of player dictionaries
+            players = []
+            for row in rows:
+                player = dict(zip(headers, row))
+                players.append(player)
+            
+            # Cache the results
+            self.all_players_cache = players
+            
+            logger.info(f"Successfully fetched {len(players)} players")
+            return players
+            
+        except (KeyError, IndexError) as e:
+            logger.error(f"Error parsing all players response: {e}")
             return None
 
     def search_player_by_name(self, player_name: str) -> Optional[int]:
         """
-        Search for a player by name to get their player ID
+        Search for a player by name to get their player ID using cached list
 
         Args:
             player_name: The player's full name
@@ -134,48 +217,50 @@ class NBADataFetcher:
             The player ID or None if not found
         """
         logger.info(f"Searching for player: {player_name}")
-
-        params = {
-            "SearchCriteria": player_name
-        }
-
-        response = self._make_api_request(PLAYER_SEARCH_ENDPOINT, params)
-
-        if not response:
+        
+        # Get all players if we haven't already
+        all_players = self.fetch_all_players()
+        if not all_players:
+            logger.error("Could not fetch player list")
             return None
-
-        try:
-            result_sets = response.get("resultSets", [])
-            if not result_sets or not result_sets[0].get("rowSet"):
-                logger.warning(f"No search results found for player: {player_name}")
-                return None
-
-            # Get all player matches
-            headers = result_sets[0]["headers"]
-            player_id_index = headers.index("PERSON_ID")
-            display_name_index = headers.index("DISPLAY_FIRST_LAST")
-            is_active_index = headers.index("IS_ACTIVE")
+        
+        # Normalize the player name for comparison
+        normalized_name = player_name.lower().strip()
+        
+        # First try exact match
+        for player in all_players:
+            # Check both display name formats
+            display_name = player.get("DISPLAY_FIRST_LAST", "").lower()
+            display_last_first = player.get("DISPLAY_LAST_COMMA_FIRST", "").lower()
             
-            # Filter for active players that match the name exactly
-            for row in result_sets[0]["rowSet"]:
-                if row[is_active_index] == 1 and row[display_name_index].lower() == player_name.lower():
-                    player_id = row[player_id_index]
-                    logger.info(f"Found exact match for {player_name}: ID {player_id}")
-                    return player_id
+            if normalized_name == display_name or normalized_name == display_last_first:
+                player_id = player.get("PERSON_ID")
+                logger.info(f"Found exact match for {player_name}: ID {player_id}")
+                return player_id
+        
+        # Then try partial matches
+        partial_matches = []
+        for player in all_players:
+            display_name = player.get("DISPLAY_FIRST_LAST", "").lower()
             
-            # If no exact active match, try partial matches
-            for row in result_sets[0]["rowSet"]:
-                if row[is_active_index] == 1 and player_name.lower() in row[display_name_index].lower():
-                    player_id = row[player_id_index]
-                    logger.info(f"Found partial match for {player_name}: {row[display_name_index]} (ID {player_id})")
-                    return player_id
-
-            logger.warning(f"No active player found for: {player_name}")
-            return None
-
-        except (KeyError, IndexError, ValueError) as e:
-            logger.error(f"Error parsing search results for {player_name}: {e}")
-            return None
+            # Check if the search name is contained in the player name
+            # or if each part of the search name appears in the player name
+            name_parts = normalized_name.split()
+            if (normalized_name in display_name or 
+                all(part in display_name for part in name_parts)):
+                partial_matches.append((
+                    player.get("PERSON_ID"),
+                    player.get("DISPLAY_FIRST_LAST")
+                ))
+        
+        if partial_matches:
+            # Just take the first match for simplicity
+            player_id, found_name = partial_matches[0]
+            logger.info(f"Found partial match for {player_name}: {found_name} (ID {player_id})")
+            return player_id
+        
+        logger.warning(f"No player found for: {player_name}")
+        return None
 
     def fetch_player_info(self, player_id: int) -> Optional[Dict[str, Any]]:
         """
@@ -640,90 +725,221 @@ def main():
         return
     
     # Initialize classes
-    fetcher = NBADataFetcher(rate_limit_wait=1.5)  # Strict 1.5 second rate limit for NBA API
+    fetcher = NBADataFetcher(rate_limit_wait=1.5, max_retries=3)  # With retry logic
     uploader = SupabaseUploader(supabase)
     
+    # Record start time for overall process
+    start_time = time.time()
+    
     # Print rate limit warning
-    logger.info("=== NBA API RATE LIMIT WARNING ===")
+    logger.info("=== NBA API CONNECTION INFO ===")
     logger.info("Using strict 1.5 second delay between API requests to avoid rate limiting")
     logger.info(f"Estimated processing time for {len(player_names)} players: " + 
                 f"approximately {len(player_names) * 4 * 1.5 / 60:.1f} minutes minimum " +
                 f"(4 API calls per player with 1.5s delay)")
+    logger.info("Added robust retry logic with exponential backoff")
+    logger.info("Using cache for player lookup to minimize API calls")
     logger.info("=============================")
+    
+    # Preload all players at the start to reduce API calls
+    logger.info("Preloading all current NBA players...")
+    all_players = fetcher.fetch_all_players()
+    if not all_players:
+        logger.error("Failed to preload player list from NBA API. Continuing with individual lookups...")
+    else:
+        logger.info(f"Successfully preloaded {len(all_players)} players from NBA API")
+    
+    # Track progress
+    progress_interval = max(1, len(player_names) // 20)  # Show progress every ~5%
+    last_progress_time = time.time()
+    
+    # Create a resumption point file to allow continuing after interruptions
+    resumption_file = "nba_progress.json"
+    processed_players = []
+    start_index = 0
+    
+    # Check if we have a resumption point
+    if os.path.exists(resumption_file):
+        try:
+            with open(resumption_file, 'r') as f:
+                resume_data = json.load(f)
+                processed_players = resume_data.get('processed', [])
+                last_player = resume_data.get('last_player', '')
+                
+                if last_player and last_player in player_names:
+                    start_index = player_names.index(last_player) + 1
+                    logger.info(f"Resuming from player {start_index}/{len(player_names)}: {last_player}")
+                else:
+                    logger.info(f"Found {len(processed_players)} previously processed players")
+        except Exception as e:
+            logger.error(f"Error reading resumption file: {e}")
+            # Continue from the beginning if there's an error
     
     # Process each player
     total_players = len(player_names)
     success_count = 0
     fail_count = 0
-    players_processed = []
     
-    logger.info(f"Starting to process {total_players} players...")
+    logger.info(f"Starting to process {total_players} players from index {start_index}...")
     
-    for i, player_name in enumerate(player_names):
-        logger.info(f"Processing player {i+1}/{total_players}: {player_name}...")
-        
-        # First, search for the player to get their ID
-        player_id = fetcher.search_player_by_name(player_name)
-        
-        if not player_id:
-            logger.error(f"Could not find player ID for: {player_name}")
-            fail_count += 1
-            continue
-        
-        # Fetch player basic info
-        basic_info = fetcher.fetch_player_info(player_id)
-        
-        if not basic_info:
-            logger.error(f"Could not fetch basic info for player: {player_name} (ID: {player_id})")
-            fail_count += 1
-            continue
-        
-        # Store basic info
-        if not uploader.store_player_basic_info(basic_info):
-            logger.error(f"Failed to store basic info for player: {player_name}")
-            fail_count += 1
-            continue
+    try:
+        for i in range(start_index, len(player_names)):
+            player_name = player_names[i]
             
-        # Fetch and store current season stats
-        current_stats = fetcher.fetch_player_stats(player_id)
-        if current_stats:
-            uploader.store_player_current_stats(player_id, current_stats)
-        else:
-            logger.warning(f"No current season stats for player: {player_name}")
-        
-        # Fetch and store career stats
-        career_stats = fetcher.fetch_player_career_stats(player_id)
-        if career_stats:
-            uploader.store_player_career_stats(player_id, career_stats)
-        else:
-            logger.warning(f"No career stats for player: {player_name}")
-        
-        # Fetch and store season highs
-        season_highs = fetcher.fetch_player_season_highs(player_id)
-        if season_highs:
-            uploader.store_player_season_highs(player_id, season_highs)
-        else:
-            logger.warning(f"No season highs for player: {player_name}")
-        
-        # Record successful processing
-        players_processed.append({
-            "name": player_name,
-            "id": player_id,
-            "full_name": basic_info.get("DISPLAY_FIRST_LAST", player_name)
-        })
-        success_count += 1
-        
-        logger.info(f"Successfully processed player: {player_name}")
+            # Show progress periodically
+            if (i - start_index + 1) % progress_interval == 0 or time.time() - last_progress_time > 300:
+                elapsed = time.time() - start_time
+                players_done = i - start_index + 1
+                if players_done > 0:
+                    avg_time_per_player = elapsed / players_done
+                    est_remaining = avg_time_per_player * (total_players - i - 1)
+                    logger.info(f"Progress: {i+1}/{total_players} players ({(i+1)/total_players*100:.1f}%)")
+                    logger.info(f"Elapsed: {elapsed/60:.1f} minutes, Est. remaining: {est_remaining/60:.1f} minutes")
+                last_progress_time = time.time()
+            
+            logger.info(f"Processing player {i+1}/{total_players}: {player_name}...")
+            
+            # Check if this player was already processed
+            already_processed = False
+            for proc in processed_players:
+                if proc.get("name") == player_name:
+                    logger.info(f"Player {player_name} was already processed in a previous run, skipping...")
+                    already_processed = True
+                    success_count += 1
+                    break
+                    
+            if already_processed:
+                continue
+            
+            # First, search for the player to get their ID
+            player_id = fetcher.search_player_by_name(player_name)
+            
+            if not player_id:
+                logger.error(f"Could not find player ID for: {player_name}")
+                fail_count += 1
+                # Update resumption point
+                with open(resumption_file, 'w') as f:
+                    json.dump({
+                        'last_player': player_name,
+                        'processed': processed_players
+                    }, f)
+                continue
+            
+            # Fetch player basic info
+            basic_info = fetcher.fetch_player_info(player_id)
+            
+            if not basic_info:
+                logger.error(f"Could not fetch basic info for player: {player_name} (ID: {player_id})")
+                fail_count += 1
+                # Update resumption point
+                with open(resumption_file, 'w') as f:
+                    json.dump({
+                        'last_player': player_name,
+                        'processed': processed_players
+                    }, f)
+                continue
+            
+            # Store basic info
+            if not uploader.store_player_basic_info(basic_info):
+                logger.error(f"Failed to store basic info for player: {player_name}")
+                fail_count += 1
+                # Update resumption point
+                with open(resumption_file, 'w') as f:
+                    json.dump({
+                        'last_player': player_name,
+                        'processed': processed_players
+                    }, f)
+                continue
+                
+            success = True
+            
+            # Fetch and store current season stats
+            current_stats = fetcher.fetch_player_stats(player_id)
+            if current_stats:
+                success = uploader.store_player_current_stats(player_id, current_stats) and success
+            else:
+                logger.warning(f"No current season stats for player: {player_name}")
+            
+            # Fetch and store career stats
+            career_stats = fetcher.fetch_player_career_stats(player_id)
+            if career_stats:
+                success = uploader.store_player_career_stats(player_id, career_stats) and success
+            else:
+                logger.warning(f"No career stats for player: {player_name}")
+            
+            # Fetch and store season highs
+            season_highs = fetcher.fetch_player_season_highs(player_id)
+            if season_highs:
+                success = uploader.store_player_season_highs(player_id, season_highs) and success
+            else:
+                logger.warning(f"No season highs for player: {player_name}")
+            
+            # Record successful processing
+            player_info = {
+                "name": player_name,
+                "id": player_id,
+                "full_name": basic_info.get("DISPLAY_FIRST_LAST", player_name),
+                "processed_at": datetime.now().isoformat()
+            }
+            
+            if success:
+                processed_players.append(player_info)
+                success_count += 1
+                logger.info(f"Successfully processed player: {player_name}")
+            else:
+                logger.warning(f"Partially processed player: {player_name}")
+                
+            # Update the resumption file periodically
+            if (i + 1) % 5 == 0:  # Every 5 players
+                with open(resumption_file, 'w') as f:
+                    json.dump({
+                        'last_player': player_name,
+                        'processed': processed_players
+                    }, f)
+    
+    except KeyboardInterrupt:
+        logger.warning("Process interrupted by user")
+        # Save progress before exiting
+        with open(resumption_file, 'w') as f:
+            json.dump({
+                'last_player': player_name if 'player_name' in locals() else '',
+                'processed': processed_players
+            }, f)
+        logger.info(f"Progress saved. Resume from player: {player_name if 'player_name' in locals() else ''}")
+    
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        # Save progress before exiting
+        with open(resumption_file, 'w') as f:
+            json.dump({
+                'last_player': player_name if 'player_name' in locals() else '',
+                'processed': processed_players
+            }, f)
+        logger.info(f"Progress saved. Resume from player: {player_name if 'player_name' in locals() else ''}")
+        raise  # Re-raise the exception after saving progress
+    
+    # Processing completed
+    elapsed_time = time.time() - start_time
     
     # Print summary
-    logger.info(f"Processing complete. Successfully processed {success_count} of {total_players} players.")
+    logger.info("=" * 50)
+    logger.info(f"Processing complete. Runtime: {elapsed_time/60:.1f} minutes")
+    logger.info(f"Successfully processed {success_count} of {total_players} players.")
     logger.info(f"Failed to process {fail_count} players.")
     
-    # Save the list of processed players for reference
+    # Save the final list of processed players
     with open("processed_players.json", "w") as f:
-        json.dump(players_processed, f, indent=2)
+        json.dump(processed_players, f, indent=2)
     
     logger.info(f"Saved list of processed players to processed_players.json")
+    
+    # Clean up resumption file if everything completed successfully
+    if success_count + fail_count == total_players and os.path.exists(resumption_file):
+        try:
+            os.remove(resumption_file)
+            logger.info(f"Removed resumption file: {resumption_file}")
+        except Exception as e:
+            logger.warning(f"Could not remove resumption file: {e}")
 
 
 if __name__ == "__main__":
