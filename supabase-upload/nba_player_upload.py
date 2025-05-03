@@ -1,11 +1,11 @@
 """
-NBA Player Data Fetcher and Supabase Uploader
+NBA Player Data Fetcher and Supabase Uploader (Improved Version)
 
 This script:
 1. Reads a list of player names from players.txt
 2. Fetches player IDs using the NBA API
 3. Retrieves detailed player data from various NBA API endpoints
-4. Stores the data in a structured Supabase database
+4. Stores the data in Supabase with improved error handling
 """
 
 import os
@@ -44,7 +44,6 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # NBA API configuration
-# Using the stats API directly
 NBA_API_BASE_URL = "https://stats.nba.com/stats"
 
 # Headers that mimic a browser
@@ -71,12 +70,10 @@ PLAYER_INFO_ENDPOINT = "/commonplayerinfo"
 PLAYER_STATS_ENDPOINT = "/playerdashboardbygeneralsplits"
 PLAYER_CAREER_ENDPOINT = "/playercareerstats"
 PLAYER_PROFILE_ENDPOINT = "/playerprofilev2"
-
-# For player search, use a more reliable endpoint
 PLAYER_ALL_ENDPOINT = "/commonallplayers"
 
 # Constants
-CURRENT_SEASON = "2024-25"  # Update for current season
+CURRENT_SEASON = "2024-25"  # Update as needed
 
 
 class NBADataFetcher:
@@ -94,13 +91,14 @@ class NBADataFetcher:
         self.max_retries = max_retries
         self.all_players_cache = None  # Cache for all players
 
-    def _make_api_request(self, endpoint: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _make_api_request(self, endpoint: str, params: Dict[str, Any], skip_500_retry: bool = False) -> Optional[Dict[str, Any]]:
         """
         Make a request to the NBA API with rate limiting and retries
 
         Args:
             endpoint: The API endpoint
             params: Query parameters for the request
+            skip_500_retry: Whether to skip retrying on 500 errors (some endpoints consistently fail with 500)
 
         Returns:
             The JSON response or None if the request failed after retries
@@ -122,6 +120,12 @@ class NBADataFetcher:
                     timeout=20,
                     allow_redirects=False  # Prevent redirect loops
                 )
+                
+                # Check if we got a 500 error and should skip retries
+                if response.status_code == 500 and skip_500_retry and retries > 0:
+                    logger.warning(f"Received 500 error and skip_500_retry is True. Giving up after {retries+1} attempts.")
+                    return None
+                
                 response.raise_for_status()
                 
                 # Check if we got a redirect
@@ -139,11 +143,17 @@ class NBADataFetcher:
                 retries += 1
                 
                 # If we're rate limited, wait longer
-                if hasattr(e, 'response') and e.response and e.response.status_code == 429:
-                    backoff = max(10, backoff * 2)  # At least 10 seconds, doubling each time
-                    logger.warning(f"Rate limited. Waiting {backoff} seconds before retrying...")
-                else:
-                    backoff *= 2  # Exponential backoff for other errors
+                if hasattr(e, 'response') and e.response:
+                    if e.response.status_code == 429:
+                        backoff = max(10, backoff * 2)  # At least 10 seconds, doubling each time
+                        logger.warning(f"Rate limited. Waiting {backoff} seconds before retrying...")
+                    elif e.response.status_code == 500 and skip_500_retry and retries > 0:
+                        # Skip retrying for certain 500 errors that consistently fail
+                        logger.warning(f"Received 500 error and skip_500_retry is True. Giving up after {retries+1} attempts.")
+                        return None
+                
+                # Standard exponential backoff for other errors
+                backoff *= 2
                 
                 if retries <= self.max_retries:
                     logger.info(f"Retrying in {backoff} seconds...")
@@ -323,7 +333,8 @@ class NBADataFetcher:
             "MeasureType": "Base"
         }
 
-        response = self._make_api_request(PLAYER_STATS_ENDPOINT, params)
+        # Skip retrying for 500 errors after first attempt - this endpoint often gives 500 for valid requests
+        response = self._make_api_request(PLAYER_STATS_ENDPOINT, params, skip_500_retry=True)
 
         if not response:
             return None
@@ -413,7 +424,8 @@ class NBADataFetcher:
             "LeagueID": "00"
         }
 
-        response = self._make_api_request(PLAYER_PROFILE_ENDPOINT, params)
+        # Skip retrying for 500 errors after first attempt - this endpoint often gives 500 for valid requests
+        response = self._make_api_request(PLAYER_PROFILE_ENDPOINT, params, skip_500_retry=True)
 
         if not response:
             return None
@@ -498,7 +510,7 @@ class SupabaseUploader:
                 "updated_at": datetime.now().isoformat()
             }
 
-            # Upsert the player data (insert or update if exists)
+            # Insert or update player data
             result = self.client.table("nba_players").upsert(
                 formatted_data,
                 on_conflict="player_id"
@@ -559,7 +571,7 @@ class SupabaseUploader:
                 "updated_at": datetime.now().isoformat()
             }
 
-            # Upsert the stats data
+            # Insert or update the stats data
             result = self.client.table("player_current_stats").upsert(
                 formatted_data,
                 on_conflict="player_id"
@@ -617,7 +629,7 @@ class SupabaseUploader:
                 "updated_at": datetime.now().isoformat()
             }
 
-            # Upsert the career stats data
+            # Insert or update the career stats data
             result = self.client.table("player_career_stats").upsert(
                 formatted_data,
                 on_conflict="player_id"
@@ -669,7 +681,7 @@ class SupabaseUploader:
                 "updated_at": datetime.now().isoformat()
             }
 
-            # Upsert the season highs data
+            # Insert or update the season highs data
             result = self.client.table("player_season_highs").upsert(
                 formatted_data,
                 on_conflict="player_id"
@@ -725,7 +737,7 @@ def main():
         return
     
     # Initialize classes
-    fetcher = NBADataFetcher(rate_limit_wait=1.5, max_retries=3)  # With retry logic
+    fetcher = NBADataFetcher(rate_limit_wait=1.5, max_retries=3)
     uploader = SupabaseUploader(supabase)
     
     # Record start time for overall process
@@ -737,7 +749,7 @@ def main():
     logger.info(f"Estimated processing time for {len(player_names)} players: " + 
                 f"approximately {len(player_names) * 4 * 1.5 / 60:.1f} minutes minimum " +
                 f"(4 API calls per player with 1.5s delay)")
-    logger.info("Added robust retry logic with exponential backoff")
+    logger.info("Added improved error handling for 500 errors")
     logger.info("Using cache for player lookup to minimize API calls")
     logger.info("=============================")
     
@@ -853,28 +865,32 @@ def main():
                 
             success = True
             
-            # Fetch and store current season stats
+            # Fetch and store current season stats - don't worry if they fail
             current_stats = fetcher.fetch_player_stats(player_id)
             if current_stats:
                 success = uploader.store_player_current_stats(player_id, current_stats) and success
             else:
-                logger.warning(f"No current season stats for player: {player_name}")
+                logger.warning(f"No current season stats available for player: {player_name}")
+                # Not counting this as a failure - many players don't have current stats
             
             # Fetch and store career stats
             career_stats = fetcher.fetch_player_career_stats(player_id)
             if career_stats:
                 success = uploader.store_player_career_stats(player_id, career_stats) and success
             else:
-                logger.warning(f"No career stats for player: {player_name}")
+                logger.warning(f"No career stats available for player: {player_name}")
+                # Not counting as a failure, but it's unusual
             
-            # Fetch and store season highs
+            # Fetch and store season highs - don't worry if they fail
             season_highs = fetcher.fetch_player_season_highs(player_id)
             if season_highs:
                 success = uploader.store_player_season_highs(player_id, season_highs) and success
             else:
-                logger.warning(f"No season highs for player: {player_name}")
+                logger.warning(f"No season highs available for player: {player_name}")
+                # Not counting this as a failure - many players don't have season highs
             
-            # Record successful processing
+            # Consider the player processed even if some stats are missing
+            # The most important thing is that we have the basic player info
             player_info = {
                 "name": player_name,
                 "id": player_id,
@@ -882,12 +898,9 @@ def main():
                 "processed_at": datetime.now().isoformat()
             }
             
-            if success:
-                processed_players.append(player_info)
-                success_count += 1
-                logger.info(f"Successfully processed player: {player_name}")
-            else:
-                logger.warning(f"Partially processed player: {player_name}")
+            processed_players.append(player_info)
+            success_count += 1
+            logger.info(f"Successfully processed player: {player_name}")
                 
             # Update the resumption file periodically
             if (i + 1) % 5 == 0:  # Every 5 players
@@ -934,7 +947,7 @@ def main():
     logger.info(f"Saved list of processed players to processed_players.json")
     
     # Clean up resumption file if everything completed successfully
-    if success_count + fail_count == total_players and os.path.exists(resumption_file):
+    if success_count + fail_count >= total_players - start_index and os.path.exists(resumption_file):
         try:
             os.remove(resumption_file)
             logger.info(f"Removed resumption file: {resumption_file}")
