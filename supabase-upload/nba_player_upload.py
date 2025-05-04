@@ -1,5 +1,5 @@
 """
-NBA Player Data Fetcher and Supabase Uploader (Improved Version)
+NBA Player Data Fetcher and Supabase Uploader (Fixed Version)
 
 This script:
 1. Reads a list of player names from players.txt
@@ -49,7 +49,7 @@ NBA_API_BASE_URL = "https://stats.nba.com/stats"
 # Headers that mimic a browser
 NBA_API_HEADERS = {
     'Host': 'stats.nba.com',
-    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
     'Accept': 'application/json, text/plain, */*',
     'Accept-Language': 'en-US,en;q=0.9',
     'Accept-Encoding': 'gzip, deflate, br',
@@ -149,7 +149,7 @@ class NBADataFetcher:
                         logger.warning(f"Rate limited. Waiting {backoff} seconds before retrying...")
                     elif e.response.status_code == 500 and skip_500_retry and retries > 0:
                         # Skip retrying for certain 500 errors that consistently fail
-                        logger.warning(f"Received 500 error and skip_500_retry is True. Giving up after {retries+1} attempts.")
+                        logger.warning(f"Received 500 error and skip_500_retry is True. Giving up after {retries} attempts.")
                         return None
                 
                 # Standard exponential backoff for other errors
@@ -161,6 +161,8 @@ class NBADataFetcher:
                 else:
                     logger.error(f"Failed after {self.max_retries+1} attempts.")
                     return None
+        
+        return None
     
     def fetch_all_players(self, force_refresh: bool = False) -> Optional[List[Dict[str, Any]]]:
         """
@@ -524,7 +526,7 @@ class SupabaseUploader:
             return True
 
         except Exception as e:
-            logger.error(f"Exception storing basic info for {player_name}: {e}")
+            logger.error(f"Exception storing basic info for {player_name}: {e}", exc_info=True)
             return False
 
     def store_player_current_stats(self, player_id: int, stats_data: Dict[str, Any]) -> bool:
@@ -585,7 +587,7 @@ class SupabaseUploader:
             return True
 
         except Exception as e:
-            logger.error(f"Exception storing current stats for player {player_id}: {e}")
+            logger.error(f"Exception storing current stats for player {player_id}: {e}", exc_info=True)
             return False
 
     def store_player_career_stats(self, player_id: int, career_data: Dict[str, Any]) -> bool:
@@ -643,7 +645,7 @@ class SupabaseUploader:
             return True
 
         except Exception as e:
-            logger.error(f"Exception storing career stats for player {player_id}: {e}")
+            logger.error(f"Exception storing career stats for player {player_id}: {e}", exc_info=True)
             return False
 
     def store_player_season_highs(self, player_id: int, highs_data: Dict[str, Any]) -> bool:
@@ -695,7 +697,7 @@ class SupabaseUploader:
             return True
 
         except Exception as e:
-            logger.error(f"Exception storing season highs for player {player_id}: {e}")
+            logger.error(f"Exception storing season highs for player {player_id}: {e}", exc_info=True)
             return False
 
 
@@ -807,7 +809,7 @@ def main():
                     est_remaining = avg_time_per_player * (total_players - i - 1)
                     logger.info(f"Progress: {i+1}/{total_players} players ({(i+1)/total_players*100:.1f}%)")
                     logger.info(f"Elapsed: {elapsed/60:.1f} minutes, Est. remaining: {est_remaining/60:.1f} minutes")
-                last_progress_time = time.time()
+                    last_progress_time = time.time()
             
             logger.info(f"Processing player {i+1}/{total_players}: {player_name}...")
             
@@ -829,12 +831,6 @@ def main():
             if not player_id:
                 logger.error(f"Could not find player ID for: {player_name}")
                 fail_count += 1
-                # Update resumption point
-                with open(resumption_file, 'w') as f:
-                    json.dump({
-                        'last_player': player_name,
-                        'processed': processed_players
-                    }, f)
                 continue
             
             # Fetch player basic info
@@ -843,24 +839,12 @@ def main():
             if not basic_info:
                 logger.error(f"Could not fetch basic info for player: {player_name} (ID: {player_id})")
                 fail_count += 1
-                # Update resumption point
-                with open(resumption_file, 'w') as f:
-                    json.dump({
-                        'last_player': player_name,
-                        'processed': processed_players
-                    }, f)
                 continue
             
             # Store basic info
             if not uploader.store_player_basic_info(basic_info):
                 logger.error(f"Failed to store basic info for player: {player_name}")
                 fail_count += 1
-                # Update resumption point
-                with open(resumption_file, 'w') as f:
-                    json.dump({
-                        'last_player': player_name,
-                        'processed': processed_players
-                    }, f)
                 continue
                 
             success = True
@@ -921,7 +905,7 @@ def main():
         logger.info(f"Progress saved. Resume from player: {player_name if 'player_name' in locals() else ''}")
     
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
+        logger.error(f"Unexpected error: {e}", exc_info=True)
         # Save progress before exiting
         with open(resumption_file, 'w') as f:
             json.dump({
