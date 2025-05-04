@@ -112,7 +112,7 @@ def main():
 
     # Define our target seasons in the desired order
     target_seasons = []
-    for year in range(2022, 2009, -1):  # Start with 2022, go backward to 2010
+    for year in range(2019, 2009, -1):  # Start with 2022, go backward to 2010
         season_str = f"{year}-{str(year+1)[-2:]}"
         if season_str in seasons:
             target_seasons.append(season_str)
